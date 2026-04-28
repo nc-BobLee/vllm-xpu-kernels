@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 
 # isort: off
 import gc
 
 import torch
 import triton
+
+from utils import bootstrap_benchmark_env, ensure_save_path_exists
+
+bootstrap_benchmark_env(__file__)
 
 from benchmark.src.flash_attn_interface_ import (
     flash_attn_varlen_func_CalKernelTime)
@@ -444,5 +449,6 @@ if __name__ == "__main__":
     configs = gen_perf_configs()
     configs = filter_configs(configs)
     benchmark = get_benchmark_varlen_with_paged_kv(iterations=iterations)
+    save_path = ensure_save_path_exists(args.save_path)
     # Run performance benchmark
-    benchmark.run(print_data=True, save_path=args.save_path)
+    benchmark.run(print_data=True, save_path=save_path)

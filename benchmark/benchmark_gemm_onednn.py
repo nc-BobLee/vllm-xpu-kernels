@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E402
 
 # isort: off
 import argparse
@@ -9,6 +10,10 @@ import itertools
 import torch
 import triton
 import triton.testing
+
+from utils import bootstrap_benchmark_env
+
+bootstrap_benchmark_env(__file__)
 
 from tests.ops.fp8_quant_op import scaled_fp8_quant
 from tests.ops.mx_utils import (
