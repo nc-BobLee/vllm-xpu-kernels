@@ -642,6 +642,17 @@ void call_rms_norm_kernel(
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
+  constexpr int kVecElems = 16 / sizeof(scalar_t);
+  TORCH_CHECK(
+      hidden_size % kVecElems == 0,
+      "rms_norm: hidden_size (",
+      hidden_size,
+      ") must be a multiple of ",
+      kVecElems,
+      " for dtype with sizeof=",
+      sizeof(scalar_t),
+      " (kernel uses 16-byte vectorized load/store)");
+
   auto out_ptr = out.data_ptr<scalar_t>();
   auto input_ptr = input.data_ptr<scalar_t>();
   auto weight_ptr = weight.data_ptr<scalar_t>();
@@ -681,6 +692,17 @@ void call_fused_add_rms_norm_kernel(
   using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
+
+  constexpr int kVecElems = 16 / sizeof(scalar_t);
+  TORCH_CHECK(
+      hidden_size % kVecElems == 0,
+      "fused_add_rms_norm: hidden_size (",
+      hidden_size,
+      ") must be a multiple of ",
+      kVecElems,
+      " for dtype with sizeof=",
+      sizeof(scalar_t),
+      " (kernel uses 16-byte vectorized load/store)");
 
   auto input_ptr = input.data_ptr<scalar_t>();
   auto residual_ptr = residual.data_ptr<scalar_t>();
