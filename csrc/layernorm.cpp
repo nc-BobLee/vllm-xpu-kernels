@@ -1,7 +1,5 @@
 #include <sycl/sycl.hpp>
 
-#include <algorithm>
-#include <type_traits>
 #include <ATen/DeviceGuard.h>
 #include "utils.h"
 #include "dispatch_utils.h"
@@ -199,7 +197,6 @@ template <typename T, int UNROLL, int threadsPerGroup, int maxThreads>
 class pre_rms_norm {
  private:
   T* output;
-  T* res_out;
   const T* vals;
   const T* residual;
   const T* gamma;
@@ -209,14 +206,12 @@ class pre_rms_norm {
  public:
   pre_rms_norm(
       T* output,
-      T* res_out,
       const T* vals,
       const T* residual,
       const T* gamma,
       float epsilon,
       int elems_per_row)
       : output(output),
-        res_out(res_out),
         vals(vals),
         residual(residual),
         gamma(gamma),
@@ -240,7 +235,6 @@ class pre_rms_norm {
 
     const T* input_base = vals + base_offset;
     const T* residual_base = residual + base_offset;
-    T* res_output = res_out + base_offset;
 
     T local_buffer[UNROLL * T_per_load];
 
@@ -267,11 +261,6 @@ class pre_rms_norm {
           var_sum = reduce::element<rop::Add, float>(
               var_sum, vals_up_cast * vals_up_cast);
         }
-      }
-
-      if (do_loads) {
-        mem_access::store_global<granularity>(
-            res_output + i * stride, iteration_buffer);
       }
     }
 
@@ -405,7 +394,6 @@ template <typename T, int UNROLL, int threadsPerGroup, int maxThreads>
 class pre_rms_norm_big {
  private:
   T* output;
-  T* res_out;
   const T* vals;
   const T* residual;
   const T* gamma;
@@ -416,7 +404,6 @@ class pre_rms_norm_big {
  public:
   pre_rms_norm_big(
       T* output,
-      T* res_out,
       const T* vals,
       const T* residual,
       const T* gamma,
@@ -424,7 +411,6 @@ class pre_rms_norm_big {
       int elems_per_row,
       int outer_iters)
       : output(output),
-        res_out(res_out),
         vals(vals),
         residual(residual),
         gamma(gamma),
@@ -472,11 +458,6 @@ class pre_rms_norm_big {
             var_sum = reduce::element<rop::Add, float>(var_sum, up * up);
           }
         }
-        if (do_loads) {
-          mem_access::store_global<granularity>(
-              res_out + block_offset + outer_off + thread_offset + i * stride,
-              ib);
-        }
       }
     }
 
@@ -486,21 +467,27 @@ class pre_rms_norm_big {
     for (int outer = 0; outer < outer_iters; outer++) {
       const int outer_off = outer * chunk_stride;
       T iter_buf[UNROLL * T_per_load];
+      T res_buf[UNROLL * T_per_load];
       T gamma_buf[UNROLL * T_per_load];
 #pragma unroll
       for (int i = 0; i < UNROLL; i++) {
         T* ib = iter_buf + i * T_per_load;
+        T* rb = res_buf + i * T_per_load;
         T* gb = gamma_buf + i * T_per_load;
         const int total_off = thread_offset + outer_off + i * stride;
         const bool do_loads = total_off < elems_per_row;
         mem_access::load_global<granularity>(
-            ib,
-            res_out + block_offset + outer_off + thread_offset + i * stride,
+            ib, vals + block_offset + outer_off + thread_offset + i * stride,
+            do_loads);
+        mem_access::load_global<granularity>(
+            rb,
+            residual + block_offset + outer_off + thread_offset + i * stride,
             do_loads);
         mem_access::load_global<granularity>(
             gb, gamma + outer_off + thread_offset + i * stride, do_loads);
 #pragma unroll
         for (int j = 0; j < T_per_load; j++) {
+          ib[j] += rb[j];
           float v = conversion::to<float>(ib[j]) * denom *
               conversion::to<float>(gb[j]);
           ib[j] = conversion::to<T>(v);
@@ -518,7 +505,6 @@ class pre_rms_norm_big {
 template <typename T>
 void launch_rms_norm_big(
     T* norm_output,
-    T* res_output,
     const T* vals,
     const T* residual,
     const T* gamma,
@@ -542,7 +528,7 @@ void launch_rms_norm_big(
   if (pre_norm) {
     stream->submit([&](sycl::handler& cgh) {
       pre_rms_norm_big<T, UNROLL, maxThreads, maxThreads> fn(
-          norm_output, res_output, vals, residual, gamma, epsilon,
+          norm_output, vals, residual, gamma, epsilon,
           elems_per_row, outer_iters);
       cgh.parallel_for(sycl::nd_range<3>(grid * block, block), fn);
     });
@@ -566,7 +552,6 @@ void launch_rms_norm_big(
   stream->submit([&](sycl::handler& cgh) {                             \
     pre_rms_norm<T, UNROLL, threadsPerGroup, maxThreads> fn(           \
         norm_output,                                                    \
-        res_output,                                                     \
         vals,                                                           \
         residual,                                                       \
         gamma,                                                          \
@@ -585,7 +570,6 @@ void launch_rms_norm_big(
 template <typename T>
 void launch_rms_norm(
     T* norm_output,
-    T* res_output,
     const T* vals,
     const T* residual,
     const T* gamma,
@@ -649,178 +633,6 @@ void launch_rms_norm(
 #undef LAUNCH_ALL_RMS_NORM
 
 template <typename scalar_t>
-class fallback_rms_norm_kernel {
- public:
-  fallback_rms_norm_kernel(
-      scalar_t* out_,
-      const scalar_t* input_,
-      const int64_t input_stride_,
-      const scalar_t* weight_,
-      const float epsilon_,
-      const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
-      : out(out_),
-        input(input_),
-        input_stride(input_stride_),
-        weight(weight_),
-        epsilon(epsilon_),
-        hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
-
-  void operator()(const sycl::nd_item<3>& item_ct1) const {
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
-
-    const int row = static_cast<int>(item_ct1.get_group(2));
-    for (int idx = static_cast<int>(item_ct1.get_local_id(2)); idx < hidden_size;
-         idx += static_cast<int>(item_ct1.get_local_range(2))) {
-      float x = static_cast<float>(input[row * input_stride + idx]);
-      variance += x * x;
-    }
-
-    variance = sycl::reduce_over_group(item_ct1.get_group(), variance, sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    for (int idx = static_cast<int>(item_ct1.get_local_id(2)); idx < hidden_size;
-         idx += static_cast<int>(item_ct1.get_local_range(2))) {
-      float x = static_cast<float>(input[row * input_stride + idx]);
-      out[row * hidden_size + idx] =
-          static_cast<scalar_t>(x * (*s_variance_ptr)) * weight[idx];
-    }
-  }
-
- private:
-  scalar_t* out;
-  const scalar_t* input;
-  int64_t input_stride;
-  const scalar_t* weight;
-  float epsilon;
-  int hidden_size;
-  sycl::local_accessor<float, 1> s_variance;
-};
-
-template <typename scalar_t>
-class fallback_fused_add_rms_norm_kernel {
- public:
-  fallback_fused_add_rms_norm_kernel(
-      scalar_t* input_,
-      scalar_t* residual_,
-      const int64_t input_stride_,
-      const scalar_t* weight_,
-      const float epsilon_,
-      const int hidden_size_,
-      sycl::local_accessor<float, 1> s_variance_)
-      : input(input_),
-        residual(residual_),
-        input_stride(input_stride_),
-        weight(weight_),
-        epsilon(epsilon_),
-        hidden_size(hidden_size_),
-        s_variance(s_variance_) {}
-
-  void operator()(const sycl::nd_item<3>& item_ct1) const {
-    float* s_variance_ptr =
-        s_variance.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float variance = 0.0f;
-
-    const int row = static_cast<int>(item_ct1.get_group(2));
-    for (int idx = static_cast<int>(item_ct1.get_local_id(2)); idx < hidden_size;
-         idx += static_cast<int>(item_ct1.get_local_range(2))) {
-      scalar_t z = input[row * input_stride + idx] + residual[row * hidden_size + idx];
-      float x = static_cast<float>(z);
-      variance += x * x;
-      residual[row * hidden_size + idx] = z;
-    }
-
-    variance = sycl::reduce_over_group(item_ct1.get_group(), variance, sycl::plus<>());
-    if (item_ct1.get_local_id(2) == 0) {
-      *s_variance_ptr = sycl::rsqrt(variance / hidden_size + epsilon);
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    for (int idx = static_cast<int>(item_ct1.get_local_id(2)); idx < hidden_size;
-         idx += static_cast<int>(item_ct1.get_local_range(2))) {
-      float x = static_cast<float>(residual[row * hidden_size + idx]);
-      input[row * input_stride + idx] =
-          static_cast<scalar_t>(x * (*s_variance_ptr)) * weight[idx];
-    }
-  }
-
- private:
-  scalar_t* input;
-  scalar_t* residual;
-  int64_t input_stride;
-  const scalar_t* weight;
-  float epsilon;
-  int hidden_size;
-  sycl::local_accessor<float, 1> s_variance;
-};
-
-template <typename scalar_t>
-void call_fallback_rms_norm_kernel(
-    torch::Tensor& out,
-    torch::Tensor& input,
-    torch::Tensor& weight,
-    float epsilon) {
-  using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
-  const int hidden_size = static_cast<int>(input.size(-1));
-  const int num_tokens = static_cast<int>(input.numel() / hidden_size);
-  const int64_t input_stride = input.stride(-2);
-  auto& queue = vllm::xpu::vllmGetQueue();
-
-  sycl::range<3> grid(1, 1, static_cast<size_t>(num_tokens));
-  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        sycl::nd_range<3>(grid * block, block),
-        fallback_rms_norm_kernel<sycl_t>(
-            reinterpret_cast<sycl_t*>(out.data_ptr<scalar_t>()),
-            reinterpret_cast<const sycl_t*>(input.data_ptr<scalar_t>()),
-            input_stride,
-            reinterpret_cast<const sycl_t*>(weight.data_ptr<scalar_t>()),
-            epsilon,
-            hidden_size,
-            s_variance));
-  });
-}
-
-template <typename scalar_t>
-void call_fallback_fused_add_rms_norm_kernel(
-    torch::Tensor& input,
-    torch::Tensor& residual,
-    torch::Tensor& weight,
-    float epsilon) {
-  using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
-  const int hidden_size = static_cast<int>(input.size(-1));
-  const int num_tokens = static_cast<int>(input.numel() / hidden_size);
-  const int64_t input_stride = input.stride(-2);
-  auto& queue = vllm::xpu::vllmGetQueue();
-
-  sycl::range<3> grid(1, 1, static_cast<size_t>(num_tokens));
-  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        sycl::nd_range<3>(grid * block, block),
-        fallback_fused_add_rms_norm_kernel<sycl_t>(
-            reinterpret_cast<sycl_t*>(input.data_ptr<scalar_t>()),
-            reinterpret_cast<sycl_t*>(residual.data_ptr<scalar_t>()),
-            input_stride,
-            reinterpret_cast<const sycl_t*>(weight.data_ptr<scalar_t>()),
-            epsilon,
-            hidden_size,
-            s_variance));
-  });
-}
-
-template <typename scalar_t>
 void call_rms_norm_kernel(
     torch::Tensor& out,
     torch::Tensor& input,
@@ -838,7 +650,6 @@ void call_rms_norm_kernel(
     auto& queue = vllm::xpu::vllmGetQueue();
     launch_rms_norm_big<sycl_t>(
         reinterpret_cast<sycl_t*>(out_ptr),
-        nullptr,
         reinterpret_cast<const sycl_t*>(input_ptr),
         nullptr,
         reinterpret_cast<const sycl_t*>(weight_ptr),
@@ -852,7 +663,6 @@ void call_rms_norm_kernel(
   auto& queue = vllm::xpu::vllmGetQueue();
   launch_rms_norm<sycl_t>(
       reinterpret_cast<sycl_t*>(out_ptr),
-      nullptr,
       reinterpret_cast<const sycl_t*>(input_ptr),
       nullptr,
       reinterpret_cast<const sycl_t*>(weight_ptr),
@@ -880,7 +690,6 @@ void call_fused_add_rms_norm_kernel(
     auto& queue = vllm::xpu::vllmGetQueue();
     launch_rms_norm_big<sycl_t>(
         reinterpret_cast<sycl_t*>(input_ptr),
-        reinterpret_cast<sycl_t*>(residual_ptr),
         reinterpret_cast<const sycl_t*>(input_ptr),
         reinterpret_cast<const sycl_t*>(residual_ptr),
         reinterpret_cast<const sycl_t*>(weight_ptr),
@@ -894,7 +703,6 @@ void call_fused_add_rms_norm_kernel(
   auto& queue = vllm::xpu::vllmGetQueue();
   launch_rms_norm<sycl_t>(
       reinterpret_cast<sycl_t*>(input_ptr),
-      reinterpret_cast<sycl_t*>(residual_ptr),
       reinterpret_cast<const sycl_t*>(input_ptr),
       reinterpret_cast<const sycl_t*>(residual_ptr),
       reinterpret_cast<const sycl_t*>(weight_ptr),
